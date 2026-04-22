@@ -1,5 +1,7 @@
 import SwiftUI
 
+// MARK: - Ports
+
 struct PortEntry: Identifiable, Hashable {
     let id = UUID()
     let process: String
@@ -109,7 +111,82 @@ enum ProtoFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-struct ContentView: View {
+// MARK: - Processes
+
+struct ProcessEntry: Identifiable, Hashable {
+    let id = UUID()
+    let pid: Int
+    let user: String
+    let cpu: Double
+    let mem: Double
+    let command: String
+    let name: String
+}
+
+@MainActor
+final class ProcessScanner: ObservableObject {
+    @Published var entries: [ProcessEntry] = []
+    @Published var isScanning = false
+    @Published var lastError: String?
+
+    init() {
+        refresh()
+    }
+
+    func refresh() {
+        isScanning = true
+        lastError = nil
+        Task.detached {
+            let entries = Self.runPs()
+            await MainActor.run {
+                self.entries = entries
+                self.isScanning = false
+            }
+        }
+    }
+
+    nonisolated static func runPs() -> [ProcessEntry] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-Ao", "pid,user,%cpu,%mem,comm"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return []
+        }
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return [] }
+        return parse(output: output)
+    }
+
+    nonisolated static func parse(output: String) -> [ProcessEntry] {
+        var results: [ProcessEntry] = []
+        let lines = output.split(separator: "\n")
+        guard lines.count > 1 else { return [] }
+        for line in lines.dropFirst() {
+            let cols = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard cols.count >= 5 else { continue }
+            guard let pid = Int(cols[0]) else { continue }
+            let user = cols[1]
+            let cpu = Double(cols[2]) ?? 0
+            let mem = Double(cols[3]) ?? 0
+            let command = cols[4...].joined(separator: " ")
+            let name = (command as NSString).lastPathComponent
+            results.append(ProcessEntry(
+                pid: pid, user: user, cpu: cpu, mem: mem, command: command, name: name
+            ))
+        }
+        return results.sorted { $0.cpu > $1.cpu }
+    }
+}
+
+// MARK: - Ports view
+
+struct PortsView: View {
     @EnvironmentObject var scanner: PortScanner
     @State private var filter = ""
     @State private var protoFilter: ProtoFilter = .all
@@ -171,80 +248,148 @@ struct ContentView: View {
             .padding(.horizontal)
             .padding(.vertical, 6)
         }
-        .frame(minWidth: 760, minHeight: 420)
     }
 }
 
-struct MenuBarPopover: View {
-    @EnvironmentObject var scanner: PortScanner
-    @Environment(\.openWindow) private var openWindow
-    @State private var protoFilter: ProtoFilter = .all
+// MARK: - Processes view
 
-    var visible: [PortEntry] {
-        protoFilter == .all
-            ? scanner.entries
-            : scanner.entries.filter { $0.proto == protoFilter.rawValue }
+struct ProcessesView: View {
+    @EnvironmentObject var scanner: ProcessScanner
+    @State private var filter = ""
+
+    var filtered: [ProcessEntry] {
+        guard !filter.isEmpty else { return scanner.entries }
+        return scanner.entries.filter {
+            $0.name.localizedCaseInsensitiveContains(filter)
+                || String($0.pid).contains(filter)
+                || $0.user.localizedCaseInsensitiveContains(filter)
+        }
     }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Open Ports").font(.headline)
-                Spacer()
-                Text("\(visible.count)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                TextField("Filter by name, PID, or user", text: $filter)
+                    .textFieldStyle(.roundedBorder)
+
                 Button(action: { scanner.refresh() }) {
                     if scanner.isScanning {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(scanner.isScanning)
+            }
+            .padding()
+
+            Table(filtered) {
+                TableColumn("PID") { Text(String($0.pid)) }.width(70)
+                TableColumn("CPU %") { Text(String(format: "%.1f", $0.cpu)) }.width(60)
+                TableColumn("MEM %") { Text(String(format: "%.1f", $0.mem)) }.width(60)
+                TableColumn("User") { Text($0.user) }.width(100)
+                TableColumn("Name") { Text($0.name) }
+            }
+
+            HStack {
+                Text("\(filtered.count) of \(scanner.entries.count) processes")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                if let err = scanner.lastError {
+                    Text(err).font(.caption).foregroundColor(.red)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+        }
+    }
+}
+
+// MARK: - Main window
+
+struct ContentView: View {
+    var body: some View {
+        TabView {
+            PortsView()
+                .tabItem { Label("Ports", systemImage: "network") }
+            ProcessesView()
+                .tabItem { Label("Processes", systemImage: "cpu") }
+        }
+        .padding(.top, 6)
+        .frame(minWidth: 760, minHeight: 460)
+    }
+}
+
+// MARK: - Menu bar popover
+
+struct MenuBarPopover: View {
+    enum Section: String, CaseIterable, Identifiable {
+        case ports = "Ports"
+        case processes = "Processes"
+        var id: String { rawValue }
+    }
+
+    @EnvironmentObject var portScanner: PortScanner
+    @EnvironmentObject var processScanner: ProcessScanner
+    @Environment(\.openWindow) private var openWindow
+    @State private var section: Section = .ports
+    @State private var protoFilter: ProtoFilter = .all
+
+    var visiblePorts: [PortEntry] {
+        protoFilter == .all
+            ? portScanner.entries
+            : portScanner.entries.filter { $0.proto == protoFilter.rawValue }
+    }
+
+    var isScanning: Bool {
+        section == .ports ? portScanner.isScanning : processScanner.isScanning
+    }
+
+    func refresh() {
+        if section == .ports { portScanner.refresh() } else { processScanner.refresh() }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Picker("", selection: $section) {
+                    ForEach(Section.allCases) { s in Text(s.rawValue).tag(s) }
+                }
+                .pickerStyle(.segmented)
+
+                Button(action: refresh) {
+                    if isScanning {
                         ProgressView().controlSize(.small)
                     } else {
                         Image(systemName: "arrow.clockwise")
                     }
                 }
                 .buttonStyle(.borderless)
-                .disabled(scanner.isScanning)
+                .disabled(isScanning)
             }
             .padding(.horizontal, 12)
             .padding(.top, 10)
             .padding(.bottom, 6)
 
-            Picker("", selection: $protoFilter) {
-                ForEach(ProtoFilter.allCases) { p in
-                    Text(p.rawValue).tag(p)
+            if section == .ports {
+                Picker("", selection: $protoFilter) {
+                    ForEach(ProtoFilter.allCases) { p in
+                        Text(p.rawValue).tag(p)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 12)
             }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 12)
 
             Divider().padding(.top, 8)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(visible) { entry in
-                        HStack(spacing: 8) {
-                            Text(entry.proto)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.secondary)
-                                .frame(width: 32, alignment: .leading)
-                            Text(String(entry.port))
-                                .font(.system(.body, design: .monospaced))
-                                .frame(width: 60, alignment: .leading)
-                            Text(entry.process)
-                                .lineLimit(1)
-                            Spacer()
-                            Text(String(entry.pid))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 3)
-                    }
-                    if visible.isEmpty {
-                        Text("No ports found")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding()
+                    if section == .ports {
+                        portsList
+                    } else {
+                        processesList
                     }
                 }
                 .padding(.vertical, 4)
@@ -266,9 +411,67 @@ struct MenuBarPopover: View {
             }
             .padding(10)
         }
-        .frame(width: 360)
+        .frame(width: 380)
+    }
+
+    @ViewBuilder
+    var portsList: some View {
+        ForEach(visiblePorts) { entry in
+            HStack(spacing: 8) {
+                Text(entry.proto)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .frame(width: 32, alignment: .leading)
+                Text(String(entry.port))
+                    .font(.system(.body, design: .monospaced))
+                    .frame(width: 60, alignment: .leading)
+                Text(entry.process)
+                    .lineLimit(1)
+                Spacer()
+                Text(String(entry.pid))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 3)
+        }
+        if visiblePorts.isEmpty {
+            Text("No ports found")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding()
+        }
+    }
+
+    @ViewBuilder
+    var processesList: some View {
+        ForEach(processScanner.entries.prefix(100)) { entry in
+            HStack(spacing: 8) {
+                Text(String(entry.pid))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .frame(width: 55, alignment: .leading)
+                Text(String(format: "%.1f", entry.cpu))
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(width: 38, alignment: .trailing)
+                Text(entry.name)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 3)
+        }
+        if processScanner.entries.count > 100 {
+            Text("+ \(processScanner.entries.count - 100) more")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding()
+        }
     }
 }
+
+// MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -280,22 +483,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct PortsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var scanner = PortScanner()
+    @StateObject private var portScanner = PortScanner()
+    @StateObject private var processScanner = ProcessScanner()
 
     var body: some Scene {
-        WindowGroup("Open Ports", id: "main") {
-            ContentView().environmentObject(scanner)
+        WindowGroup("NewApp", id: "main") {
+            ContentView()
+                .environmentObject(portScanner)
+                .environmentObject(processScanner)
         }
         .commands {
             CommandGroup(replacing: .newItem) { }
-            CommandMenu("Ports") {
-                Button("Refresh") { scanner.refresh() }
-                    .keyboardShortcut("r")
+            CommandMenu("Scan") {
+                Button("Refresh") {
+                    portScanner.refresh()
+                    processScanner.refresh()
+                }
+                .keyboardShortcut("r")
             }
         }
 
-        MenuBarExtra("Open Ports", systemImage: "network") {
-            MenuBarPopover().environmentObject(scanner)
+        MenuBarExtra("NewApp", systemImage: "network") {
+            MenuBarPopover()
+                .environmentObject(portScanner)
+                .environmentObject(processScanner)
         }
         .menuBarExtraStyle(.window)
     }
