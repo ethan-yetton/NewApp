@@ -1,4 +1,5 @@
 import SwiftUI
+import Darwin
 
 // MARK: - Ports
 
@@ -184,6 +185,200 @@ final class ProcessScanner: ObservableObject {
     }
 }
 
+// MARK: - System
+
+struct SystemStats {
+    var cpuUserPct: Double = 0
+    var cpuSystemPct: Double = 0
+    var cpuIdlePct: Double = 0
+    var cpuNicePct: Double = 0
+
+    var totalMem: UInt64 = 0
+    var usedMem: UInt64 = 0
+    var wiredMem: UInt64 = 0
+    var compressedMem: UInt64 = 0
+    var activeMem: UInt64 = 0
+    var inactiveMem: UInt64 = 0
+    var freeMem: UInt64 = 0
+
+    var cpuUsedPct: Double { 1.0 - cpuIdlePct }
+
+    var memUsedPct: Double {
+        guard totalMem > 0 else { return 0 }
+        return min(1.0, Double(usedMem) / Double(totalMem))
+    }
+}
+
+@MainActor
+final class SystemMonitor: ObservableObject {
+    @Published var stats = SystemStats()
+    private var lastTicks: (user: UInt32, system: UInt32, idle: UInt32, nice: UInt32)?
+    private var timer: Timer?
+
+    init() {
+        refresh()
+        let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    deinit { timer?.invalidate() }
+
+    func refresh() {
+        var s = stats
+        if let cpu = readCPU() {
+            s.cpuUserPct = cpu.user
+            s.cpuSystemPct = cpu.system
+            s.cpuIdlePct = cpu.idle
+            s.cpuNicePct = cpu.nice
+        }
+        if let mem = readMem() {
+            s.totalMem = mem.total
+            s.usedMem = mem.used
+            s.wiredMem = mem.wired
+            s.compressedMem = mem.compressed
+            s.activeMem = mem.active
+            s.inactiveMem = mem.inactive
+            s.freeMem = mem.free
+        }
+        stats = s
+    }
+
+    private func readCPU() -> (user: Double, system: Double, idle: Double, nice: Double)? {
+        var info = host_cpu_load_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { ptr in
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, ptr, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        let user = info.cpu_ticks.0
+        let system = info.cpu_ticks.1
+        let idle = info.cpu_ticks.2
+        let nice = info.cpu_ticks.3
+        defer { lastTicks = (user, system, idle, nice) }
+        guard let last = lastTicks else { return nil }
+        let dUser = Double(user &- last.user)
+        let dSystem = Double(system &- last.system)
+        let dIdle = Double(idle &- last.idle)
+        let dNice = Double(nice &- last.nice)
+        let total = dUser + dSystem + dIdle + dNice
+        guard total > 0 else { return nil }
+        return (dUser / total, dSystem / total, dIdle / total, dNice / total)
+    }
+
+    private func readMem() -> (total: UInt64, used: UInt64, wired: UInt64, compressed: UInt64, active: UInt64, inactive: UInt64, free: UInt64)? {
+        var vm = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &vm) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { ptr in
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, ptr, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        let pageSize = UInt64(vm_kernel_page_size)
+        var total: UInt64 = 0
+        var sz = MemoryLayout<UInt64>.size
+        sysctlbyname("hw.memsize", &total, &sz, nil, 0)
+        let active = UInt64(vm.active_count) * pageSize
+        let wired = UInt64(vm.wire_count) * pageSize
+        let compressed = UInt64(vm.compressor_page_count) * pageSize
+        let inactive = UInt64(vm.inactive_count) * pageSize
+        let free = UInt64(vm.free_count) * pageSize
+        let used = active + wired + compressed
+        return (total: total, used: used, wired: wired, compressed: compressed, active: active, inactive: inactive, free: free)
+    }
+}
+
+private func formatBytes(_ bytes: UInt64) -> String {
+    let f = ByteCountFormatter()
+    f.allowedUnits = [.useGB, .useMB]
+    f.countStyle = .memory
+    return f.string(fromByteCount: Int64(bytes))
+}
+
+// MARK: - System view
+
+struct SystemView: View {
+    @EnvironmentObject var monitor: SystemMonitor
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                cpuSection
+                memSection
+                Spacer(minLength: 0)
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var cpuSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("CPU").font(.headline)
+            HStack {
+                Text("Usage").frame(width: 90, alignment: .leading)
+                ProgressView(value: monitor.stats.cpuUsedPct)
+                Text(String(format: "%.1f%%", monitor.stats.cpuUsedPct * 100))
+                    .font(.system(.body, design: .monospaced))
+                    .frame(width: 70, alignment: .trailing)
+            }
+            HStack(spacing: 20) {
+                cpuStat("User", monitor.stats.cpuUserPct)
+                cpuStat("System", monitor.stats.cpuSystemPct)
+                cpuStat("Nice", monitor.stats.cpuNicePct)
+                cpuStat("Idle", monitor.stats.cpuIdlePct)
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+    }
+
+    private func cpuStat(_ name: String, _ value: Double) -> some View {
+        HStack(spacing: 4) {
+            Text("\(name):")
+            Text(String(format: "%.1f%%", value * 100))
+                .font(.system(.caption, design: .monospaced))
+        }
+    }
+
+    private var memSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Memory").font(.headline)
+            HStack {
+                Text("Used").frame(width: 90, alignment: .leading)
+                ProgressView(value: monitor.stats.memUsedPct)
+                Text(String(format: "%.1f%%", monitor.stats.memUsedPct * 100))
+                    .font(.system(.body, design: .monospaced))
+                    .frame(width: 70, alignment: .trailing)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                memRow("Total", monitor.stats.totalMem)
+                memRow("Used", monitor.stats.usedMem)
+                memRow("Wired", monitor.stats.wiredMem)
+                memRow("Active", monitor.stats.activeMem)
+                memRow("Compressed", monitor.stats.compressedMem)
+                memRow("Inactive", monitor.stats.inactiveMem)
+                memRow("Free", monitor.stats.freeMem)
+            }
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(.secondary)
+        }
+    }
+
+    private func memRow(_ name: String, _ bytes: UInt64) -> some View {
+        HStack {
+            Text(name).frame(width: 110, alignment: .leading)
+            Text(formatBytes(bytes)).frame(width: 110, alignment: .trailing)
+            Spacer()
+        }
+    }
+}
+
 // MARK: - Ports view
 
 struct PortsView: View {
@@ -315,6 +510,8 @@ struct ContentView: View {
                 .tabItem { Label("Ports", systemImage: "network") }
             ProcessesView()
                 .tabItem { Label("Processes", systemImage: "cpu") }
+            SystemView()
+                .tabItem { Label("System", systemImage: "gauge") }
         }
         .padding(.top, 6)
         .frame(minWidth: 760, minHeight: 460)
@@ -485,12 +682,14 @@ struct PortsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var portScanner = PortScanner()
     @StateObject private var processScanner = ProcessScanner()
+    @StateObject private var systemMonitor = SystemMonitor()
 
     var body: some Scene {
         WindowGroup("NewApp", id: "main") {
             ContentView()
                 .environmentObject(portScanner)
                 .environmentObject(processScanner)
+                .environmentObject(systemMonitor)
         }
         .commands {
             CommandGroup(replacing: .newItem) { }
@@ -507,6 +706,7 @@ struct PortsApp: App {
             MenuBarPopover()
                 .environmentObject(portScanner)
                 .environmentObject(processScanner)
+                .environmentObject(systemMonitor)
         }
         .menuBarExtraStyle(.window)
     }
