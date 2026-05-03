@@ -201,11 +201,21 @@ struct SystemStats {
     var inactiveMem: UInt64 = 0
     var freeMem: UInt64 = 0
 
+    var diskTotal: UInt64 = 0
+    var diskUsed: UInt64 = 0
+    var diskFree: UInt64 = 0
+    var diskVolumeName: String = "/"
+
     var cpuUsedPct: Double { 1.0 - cpuIdlePct }
 
     var memUsedPct: Double {
         guard totalMem > 0 else { return 0 }
         return min(1.0, Double(usedMem) / Double(totalMem))
+    }
+
+    var diskUsedPct: Double {
+        guard diskTotal > 0 else { return 0 }
+        return min(1.0, Double(diskUsed) / Double(diskTotal))
     }
 }
 
@@ -243,7 +253,25 @@ final class SystemMonitor: ObservableObject {
             s.inactiveMem = mem.inactive
             s.freeMem = mem.free
         }
+        if let disk = readDisk() {
+            s.diskTotal = disk.total
+            s.diskUsed = disk.used
+            s.diskFree = disk.free
+            s.diskVolumeName = disk.name
+        }
         stats = s
+    }
+
+    private func readDisk() -> (total: UInt64, used: UInt64, free: UInt64, name: String)? {
+        let url = URL(fileURLWithPath: "/")
+        let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityKey, .volumeNameKey]
+        guard let values = try? url.resourceValues(forKeys: keys),
+              let total = values.volumeTotalCapacity,
+              let avail = values.volumeAvailableCapacity else { return nil }
+        let t = UInt64(total)
+        let a = UInt64(avail)
+        let used = t > a ? t - a : 0
+        return (total: t, used: used, free: a, name: values.volumeName ?? "/")
     }
 
     private func readCPU() -> (user: Double, system: Double, idle: Double, nice: Double)? {
@@ -300,6 +328,13 @@ private func formatBytes(_ bytes: UInt64) -> String {
     return f.string(fromByteCount: Int64(bytes))
 }
 
+private func formatDiskBytes(_ bytes: UInt64) -> String {
+    let f = ByteCountFormatter()
+    f.allowedUnits = [.useGB, .useMB, .useTB]
+    f.countStyle = .file
+    return f.string(fromByteCount: Int64(bytes))
+}
+
 // MARK: - System view
 
 struct SystemView: View {
@@ -310,6 +345,7 @@ struct SystemView: View {
             VStack(alignment: .leading, spacing: 24) {
                 cpuSection
                 memSection
+                diskSection
                 Spacer(minLength: 0)
             }
             .padding()
@@ -375,6 +411,196 @@ struct SystemView: View {
             Text(name).frame(width: 110, alignment: .leading)
             Text(formatBytes(bytes)).frame(width: 110, alignment: .trailing)
             Spacer()
+        }
+    }
+
+    private var diskSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text("Disk").font(.headline)
+                Text("(\(monitor.stats.diskVolumeName))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            HStack {
+                Text("Used").frame(width: 90, alignment: .leading)
+                ProgressView(value: monitor.stats.diskUsedPct)
+                Text(String(format: "%.1f%%", monitor.stats.diskUsedPct * 100))
+                    .font(.system(.body, design: .monospaced))
+                    .frame(width: 70, alignment: .trailing)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                diskRow("Total", monitor.stats.diskTotal)
+                diskRow("Used", monitor.stats.diskUsed)
+                diskRow("Free", monitor.stats.diskFree)
+            }
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(.secondary)
+        }
+    }
+
+    private func diskRow(_ name: String, _ bytes: UInt64) -> some View {
+        HStack {
+            Text(name).frame(width: 110, alignment: .leading)
+            Text(formatDiskBytes(bytes)).frame(width: 110, alignment: .trailing)
+            Spacer()
+        }
+    }
+}
+
+// MARK: - Apps
+
+struct AppEntry: Identifiable, Hashable {
+    let id = UUID()
+    let name: String
+    let version: String
+    let bundleID: String
+    let path: String
+    let modified: Date?
+}
+
+@MainActor
+final class AppScanner: ObservableObject {
+    @Published var entries: [AppEntry] = []
+    @Published var isScanning = false
+
+    init() { refresh() }
+
+    func refresh() {
+        isScanning = true
+        Task.detached {
+            let entries = Self.scan()
+            await MainActor.run {
+                self.entries = entries
+                self.isScanning = false
+            }
+        }
+    }
+
+    nonisolated static func scan() -> [AppEntry] {
+        let home = NSHomeDirectory()
+        let roots = [
+            "/Applications",
+            "/Applications/Utilities",
+            "/System/Applications",
+            "/System/Applications/Utilities",
+            "\(home)/Applications"
+        ]
+        let fm = FileManager.default
+        var results: [AppEntry] = []
+        var seen = Set<String>()
+        for root in roots {
+            guard let items = try? fm.contentsOfDirectory(atPath: root) else { continue }
+            for item in items where item.hasSuffix(".app") {
+                let path = "\(root)/\(item)"
+                guard seen.insert(path).inserted else { continue }
+                if let entry = readApp(at: path) {
+                    results.append(entry)
+                }
+            }
+        }
+        return results.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    nonisolated static func readApp(at path: String) -> AppEntry? {
+        let info = Bundle(path: path)?.infoDictionary ?? [:]
+        let fallbackName = (path as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "")
+        let name = (info["CFBundleDisplayName"] as? String)
+            ?? (info["CFBundleName"] as? String)
+            ?? fallbackName
+        let version = (info["CFBundleShortVersionString"] as? String)
+            ?? (info["CFBundleVersion"] as? String)
+            ?? ""
+        let bundleID = (info["CFBundleIdentifier"] as? String) ?? ""
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let modified = attrs?[.modificationDate] as? Date
+        return AppEntry(
+            name: name,
+            version: version,
+            bundleID: bundleID,
+            path: path,
+            modified: modified
+        )
+    }
+}
+
+// MARK: - Apps view
+
+struct AppsView: View {
+    @EnvironmentObject var scanner: AppScanner
+    @State private var filter = ""
+
+    var filtered: [AppEntry] {
+        guard !filter.isEmpty else { return scanner.entries }
+        return scanner.entries.filter {
+            $0.name.localizedCaseInsensitiveContains(filter)
+                || $0.bundleID.localizedCaseInsensitiveContains(filter)
+        }
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f
+    }()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                TextField("Filter by name or bundle ID", text: $filter)
+                    .textFieldStyle(.roundedBorder)
+
+                Button(action: { scanner.refresh() }) {
+                    if scanner.isScanning {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(scanner.isScanning)
+            }
+            .padding()
+
+            Table(filtered) {
+                TableColumn("Name") { Text($0.name) }
+                TableColumn("Version") { Text($0.version) }.width(80)
+                TableColumn("Bundle ID") { entry in
+                    Text(entry.bundleID)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+                TableColumn("Modified") { entry in
+                    Text(entry.modified.map { Self.dateFormatter.string(from: $0) } ?? "")
+                        .foregroundColor(.secondary)
+                }.width(110)
+                TableColumn("Path") { entry in
+                    Text(entry.path)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .contextMenu(forSelectionType: AppEntry.ID.self) { ids in
+                if let id = ids.first, let app = scanner.entries.first(where: { $0.id == id }) {
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: app.path)])
+                    }
+                    Button("Open") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: app.path))
+                    }
+                }
+            }
+
+            HStack {
+                Text("\(filtered.count) of \(scanner.entries.count) apps")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
         }
     }
 }
@@ -512,6 +738,8 @@ struct ContentView: View {
                 .tabItem { Label("Processes", systemImage: "cpu") }
             SystemView()
                 .tabItem { Label("System", systemImage: "gauge") }
+            AppsView()
+                .tabItem { Label("Apps", systemImage: "app.badge") }
         }
         .padding(.top, 6)
         .frame(minWidth: 760, minHeight: 460)
@@ -524,14 +752,19 @@ struct MenuBarPopover: View {
     enum Section: String, CaseIterable, Identifiable {
         case ports = "Ports"
         case processes = "Processes"
+        case system = "System"
+        case apps = "Apps"
         var id: String { rawValue }
     }
 
     @EnvironmentObject var portScanner: PortScanner
     @EnvironmentObject var processScanner: ProcessScanner
+    @EnvironmentObject var systemMonitor: SystemMonitor
+    @EnvironmentObject var appScanner: AppScanner
     @Environment(\.openWindow) private var openWindow
     @State private var section: Section = .ports
     @State private var protoFilter: ProtoFilter = .all
+    @State private var appFilter: String = ""
 
     var visiblePorts: [PortEntry] {
         protoFilter == .all
@@ -540,11 +773,29 @@ struct MenuBarPopover: View {
     }
 
     var isScanning: Bool {
-        section == .ports ? portScanner.isScanning : processScanner.isScanning
+        switch section {
+        case .ports: return portScanner.isScanning
+        case .processes: return processScanner.isScanning
+        case .system: return false
+        case .apps: return appScanner.isScanning
+        }
     }
 
     func refresh() {
-        if section == .ports { portScanner.refresh() } else { processScanner.refresh() }
+        switch section {
+        case .ports: portScanner.refresh()
+        case .processes: processScanner.refresh()
+        case .system: systemMonitor.refresh()
+        case .apps: appScanner.refresh()
+        }
+    }
+
+    var visibleApps: [AppEntry] {
+        guard !appFilter.isEmpty else { return appScanner.entries }
+        return appScanner.entries.filter {
+            $0.name.localizedCaseInsensitiveContains(appFilter)
+                || $0.bundleID.localizedCaseInsensitiveContains(appFilter)
+        }
     }
 
     var body: some View {
@@ -577,16 +828,21 @@ struct MenuBarPopover: View {
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal, 12)
+            } else if section == .apps {
+                TextField("Filter apps", text: $appFilter)
+                    .textFieldStyle(.roundedBorder)
+                    .padding(.horizontal, 12)
             }
 
             Divider().padding(.top, 8)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if section == .ports {
-                        portsList
-                    } else {
-                        processesList
+                    switch section {
+                    case .ports: portsList
+                    case .processes: processesList
+                    case .system: systemList
+                    case .apps: appsList
                     }
                 }
                 .padding(.vertical, 4)
@@ -666,6 +922,121 @@ struct MenuBarPopover: View {
                 .padding()
         }
     }
+
+    @ViewBuilder
+    var systemList: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("CPU").font(.headline)
+                    Spacer()
+                    Text(String(format: "%.1f%%", systemMonitor.stats.cpuUsedPct * 100))
+                        .font(.system(.body, design: .monospaced))
+                }
+                ProgressView(value: systemMonitor.stats.cpuUsedPct)
+                HStack(spacing: 12) {
+                    popoverStat("User", systemMonitor.stats.cpuUserPct)
+                    popoverStat("Sys", systemMonitor.stats.cpuSystemPct)
+                    popoverStat("Idle", systemMonitor.stats.cpuIdlePct)
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Memory").font(.headline)
+                    Spacer()
+                    Text(String(format: "%.1f%%", systemMonitor.stats.memUsedPct * 100))
+                        .font(.system(.body, design: .monospaced))
+                }
+                ProgressView(value: systemMonitor.stats.memUsedPct)
+                HStack {
+                    Text("\(formatBytes(systemMonitor.stats.usedMem)) used")
+                    Spacer()
+                    Text("of \(formatBytes(systemMonitor.stats.totalMem))")
+                }
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    popoverMemRow("Wired", systemMonitor.stats.wiredMem)
+                    popoverMemRow("Active", systemMonitor.stats.activeMem)
+                    popoverMemRow("Compressed", systemMonitor.stats.compressedMem)
+                    popoverMemRow("Inactive", systemMonitor.stats.inactiveMem)
+                    popoverMemRow("Free", systemMonitor.stats.freeMem)
+                }
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Disk").font(.headline)
+                    Text("(\(systemMonitor.stats.diskVolumeName))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(String(format: "%.1f%%", systemMonitor.stats.diskUsedPct * 100))
+                        .font(.system(.body, design: .monospaced))
+                }
+                ProgressView(value: systemMonitor.stats.diskUsedPct)
+                HStack {
+                    Text("\(formatDiskBytes(systemMonitor.stats.diskUsed)) used")
+                    Spacer()
+                    Text("of \(formatDiskBytes(systemMonitor.stats.diskTotal))")
+                }
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private func popoverStat(_ name: String, _ value: Double) -> some View {
+        HStack(spacing: 3) {
+            Text("\(name):")
+            Text(String(format: "%.1f%%", value * 100))
+                .font(.system(.caption, design: .monospaced))
+        }
+    }
+
+    private func popoverMemRow(_ name: String, _ bytes: UInt64) -> some View {
+        HStack {
+            Text(name).frame(width: 90, alignment: .leading)
+            Text(formatBytes(bytes))
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    var appsList: some View {
+        ForEach(visibleApps) { app in
+            Button {
+                NSWorkspace.shared.open(URL(fileURLWithPath: app.path))
+            } label: {
+                HStack(spacing: 8) {
+                    Text(app.name)
+                        .lineLimit(1)
+                    Spacer()
+                    Text(app.version)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+            }
+            .buttonStyle(.plain)
+        }
+        if visibleApps.isEmpty {
+            Text(appScanner.isScanning ? "Scanning…" : "No apps found")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding()
+        }
+    }
 }
 
 // MARK: - App
@@ -683,6 +1054,7 @@ struct PortsApp: App {
     @StateObject private var portScanner = PortScanner()
     @StateObject private var processScanner = ProcessScanner()
     @StateObject private var systemMonitor = SystemMonitor()
+    @StateObject private var appScanner = AppScanner()
 
     var body: some Scene {
         WindowGroup("NewApp", id: "main") {
@@ -690,6 +1062,7 @@ struct PortsApp: App {
                 .environmentObject(portScanner)
                 .environmentObject(processScanner)
                 .environmentObject(systemMonitor)
+                .environmentObject(appScanner)
         }
         .commands {
             CommandGroup(replacing: .newItem) { }
@@ -707,6 +1080,7 @@ struct PortsApp: App {
                 .environmentObject(portScanner)
                 .environmentObject(processScanner)
                 .environmentObject(systemMonitor)
+                .environmentObject(appScanner)
         }
         .menuBarExtraStyle(.window)
     }
