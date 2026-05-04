@@ -605,6 +605,196 @@ struct AppsView: View {
     }
 }
 
+// MARK: - Temp Files
+
+struct TempFileEntry: Identifiable, Hashable {
+    let id = UUID()
+    let name: String
+    let path: String
+    let size: UInt64
+    let isDirectory: Bool
+    let modified: Date?
+    let location: String
+}
+
+@MainActor
+final class TempFileScanner: ObservableObject {
+    @Published var entries: [TempFileEntry] = []
+    @Published var isScanning = false
+    @Published var totalSize: UInt64 = 0
+
+    init() { refresh() }
+
+    func refresh() {
+        isScanning = true
+        Task.detached {
+            let entries = Self.scan()
+            let total = entries.reduce(UInt64(0)) { $0 + $1.size }
+            await MainActor.run {
+                self.entries = entries
+                self.totalSize = total
+                self.isScanning = false
+            }
+        }
+    }
+
+    nonisolated static func scan() -> [TempFileEntry] {
+        let roots: [(path: String, label: String)] = [
+            ("/tmp", "/tmp"),
+            ("/private/var/tmp", "/var/tmp"),
+            (NSTemporaryDirectory(), "User Temp")
+        ]
+        let fm = FileManager.default
+        var results: [TempFileEntry] = []
+        var seen = Set<String>()
+        for root in roots {
+            let resolved = (root.path as NSString).resolvingSymlinksInPath
+            guard let items = try? fm.contentsOfDirectory(atPath: resolved) else { continue }
+            for item in items {
+                let path = (resolved as NSString).appendingPathComponent(item)
+                guard seen.insert(path).inserted else { continue }
+                guard let attrs = try? fm.attributesOfItem(atPath: path) else { continue }
+                let isDir = (attrs[.type] as? FileAttributeType) == .typeDirectory
+                let modified = attrs[.modificationDate] as? Date
+                let size = isDir
+                    ? directorySize(at: path)
+                    : (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+                results.append(TempFileEntry(
+                    name: item,
+                    path: path,
+                    size: size,
+                    isDirectory: isDir,
+                    modified: modified,
+                    location: root.label
+                ))
+            }
+        }
+        return results.sorted { $0.size > $1.size }
+    }
+
+    nonisolated static func directorySize(at path: String) -> UInt64 {
+        let url = URL(fileURLWithPath: path)
+        let keys: Set<URLResourceKey> = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: Array(keys),
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else { return 0 }
+        var total: UInt64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: keys),
+                  values.isRegularFile == true else { continue }
+            let size = values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0
+            total += UInt64(size)
+        }
+        return total
+    }
+}
+
+// MARK: - Temp Files view
+
+struct TempFilesView: View {
+    @EnvironmentObject var scanner: TempFileScanner
+    @State private var filter = ""
+    @State private var locationFilter = "All"
+
+    var locations: [String] {
+        var out = ["All"]
+        for e in scanner.entries where !out.contains(e.location) {
+            out.append(e.location)
+        }
+        return out
+    }
+
+    var filtered: [TempFileEntry] {
+        scanner.entries.filter { entry in
+            let locOK = locationFilter == "All" || entry.location == locationFilter
+            let textOK = filter.isEmpty
+                || entry.name.localizedCaseInsensitiveContains(filter)
+                || entry.path.localizedCaseInsensitiveContains(filter)
+            return locOK && textOK
+        }
+    }
+
+    var filteredSize: UInt64 {
+        filtered.reduce(0) { $0 + $1.size }
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                TextField("Filter by name or path", text: $filter)
+                    .textFieldStyle(.roundedBorder)
+
+                Picker("", selection: $locationFilter) {
+                    ForEach(locations, id: \.self) { Text($0).tag($0) }
+                }
+                .frame(width: 140)
+
+                Button(action: { scanner.refresh() }) {
+                    if scanner.isScanning {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(scanner.isScanning)
+            }
+            .padding()
+
+            Table(filtered) {
+                TableColumn("Name") { entry in
+                    HStack(spacing: 6) {
+                        Image(systemName: entry.isDirectory ? "folder" : "doc")
+                            .foregroundColor(.secondary)
+                        Text(entry.name).lineLimit(1)
+                    }
+                }
+                TableColumn("Size") { entry in
+                    Text(formatDiskBytes(entry.size))
+                        .font(.system(.body, design: .monospaced))
+                }.width(90)
+                TableColumn("Modified") { entry in
+                    Text(entry.modified.map { Self.dateFormatter.string(from: $0) } ?? "")
+                        .foregroundColor(.secondary)
+                }.width(150)
+                TableColumn("Location") { entry in
+                    Text(entry.location).foregroundColor(.secondary)
+                }.width(110)
+                TableColumn("Path") { entry in
+                    Text(entry.path)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .contextMenu(forSelectionType: TempFileEntry.ID.self) { ids in
+                if let id = ids.first, let entry = scanner.entries.first(where: { $0.id == id }) {
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: entry.path)])
+                    }
+                }
+            }
+
+            HStack {
+                Text("\(filtered.count) of \(scanner.entries.count) items · \(formatDiskBytes(filteredSize)) shown · \(formatDiskBytes(scanner.totalSize)) total")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+        }
+    }
+}
+
 // MARK: - Ports view
 
 struct PortsView: View {
@@ -740,6 +930,8 @@ struct ContentView: View {
                 .tabItem { Label("System", systemImage: "gauge") }
             AppsView()
                 .tabItem { Label("Apps", systemImage: "app.badge") }
+            TempFilesView()
+                .tabItem { Label("Temp Files", systemImage: "tray.full") }
         }
         .padding(.top, 6)
         .frame(minWidth: 760, minHeight: 460)
@@ -754,6 +946,7 @@ struct MenuBarPopover: View {
         case processes = "Processes"
         case system = "System"
         case apps = "Apps"
+        case tempFiles = "Temp"
         var id: String { rawValue }
     }
 
@@ -761,6 +954,7 @@ struct MenuBarPopover: View {
     @EnvironmentObject var processScanner: ProcessScanner
     @EnvironmentObject var systemMonitor: SystemMonitor
     @EnvironmentObject var appScanner: AppScanner
+    @EnvironmentObject var tempFileScanner: TempFileScanner
     @Environment(\.openWindow) private var openWindow
     @State private var section: Section = .ports
     @State private var protoFilter: ProtoFilter = .all
@@ -778,6 +972,7 @@ struct MenuBarPopover: View {
         case .processes: return processScanner.isScanning
         case .system: return false
         case .apps: return appScanner.isScanning
+        case .tempFiles: return tempFileScanner.isScanning
         }
     }
 
@@ -787,6 +982,7 @@ struct MenuBarPopover: View {
         case .processes: processScanner.refresh()
         case .system: systemMonitor.refresh()
         case .apps: appScanner.refresh()
+        case .tempFiles: tempFileScanner.refresh()
         }
     }
 
@@ -843,6 +1039,7 @@ struct MenuBarPopover: View {
                     case .processes: processesList
                     case .system: systemList
                     case .apps: appsList
+                    case .tempFiles: tempFilesList
                     }
                 }
                 .padding(.vertical, 4)
@@ -1037,6 +1234,57 @@ struct MenuBarPopover: View {
                 .padding()
         }
     }
+
+    @ViewBuilder
+    var tempFilesList: some View {
+        ForEach(tempFileScanner.entries.prefix(100)) { entry in
+            HStack(spacing: 8) {
+                Image(systemName: entry.isDirectory ? "folder" : "doc")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(entry.name)
+                        .lineLimit(1)
+                    Text(entry.location)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Text(formatDiskBytes(entry.size))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 3)
+        }
+        if tempFileScanner.entries.isEmpty {
+            Text(tempFileScanner.isScanning ? "Scanning…" : "No temp files found")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding()
+        } else if tempFileScanner.entries.count > 100 {
+            Text("+ \(tempFileScanner.entries.count - 100) more")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding()
+        }
+        if !tempFileScanner.entries.isEmpty {
+            Divider().padding(.vertical, 4)
+            HStack {
+                Text("Total")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(formatDiskBytes(tempFileScanner.totalSize))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 4)
+        }
+    }
 }
 
 // MARK: - App
@@ -1055,6 +1303,7 @@ struct PortsApp: App {
     @StateObject private var processScanner = ProcessScanner()
     @StateObject private var systemMonitor = SystemMonitor()
     @StateObject private var appScanner = AppScanner()
+    @StateObject private var tempFileScanner = TempFileScanner()
 
     var body: some Scene {
         WindowGroup("NewApp", id: "main") {
@@ -1063,6 +1312,7 @@ struct PortsApp: App {
                 .environmentObject(processScanner)
                 .environmentObject(systemMonitor)
                 .environmentObject(appScanner)
+                .environmentObject(tempFileScanner)
         }
         .commands {
             CommandGroup(replacing: .newItem) { }
@@ -1081,6 +1331,7 @@ struct PortsApp: App {
                 .environmentObject(processScanner)
                 .environmentObject(systemMonitor)
                 .environmentObject(appScanner)
+                .environmentObject(tempFileScanner)
         }
         .menuBarExtraStyle(.window)
     }
